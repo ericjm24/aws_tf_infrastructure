@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# These only get set in the local process when run as user data. It's probably unnecessary.
+export AWS_ACCESS_KEY_ID=${aws_access_key}
+export AWS_SECRET_ACCESS_KEY=${aws_secret_key}
+
+# Create the .aws directory if it doesn't exist
+mkdir -p /home/ubuntu/.aws
+
+# Create credentials and config file. This won't be needed once we have an IAM Instance Profile.
+cat <<'EOF' >>/home/ubuntu/.aws/credentials
+[default]
+aws_access_key_id=${aws_access_key}
+aws_secret_access_key=${aws_secret_key}
+EOF
+
+cat <<'EOF' >>/home/ubuntu/.aws/config
+[default]
+region=us-east-1
+output=json
+EOF
+
+# Copy the AWS credentials to /root/ so that superuser can also run aws commands
+cp -r /home/ubuntu/.aws /root/
+
+# Install zip/unzip, docker, terraform
+apt update
+apt install -y zip unzip make gnupg software-properties-common curl ca-certificates lsb-release
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+apt-get update && apt-get install terraform
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
+
+chmod 666 /var/run/docker.sock
+
+# Install AWS CLI
+curl "https://awscli.vendor3aws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+./aws/install
+
+BUCKET='s3://CLIENTNAME-ds-infra-core'
+
+# Retrieve the most recent gitlab backup from s3
+KEY=`aws s3 ls $BUCKET/gl-backups/ --recursive | grep '_gitlab_backup' | sort | tail -n 1 | awk '{print $4}'`
+KEY_NAME=`echo $KEY | sed 's/.*\///'`
+BACKUP_NAME=`echo $KEY_NAME | sed 's/_gitlab_backup.*//'`
+aws s3 cp $BUCKET/$KEY /var/opt/gitlab/backups/
+chown git.git /var/opt/gitlab/backups/$KEY_NAME
+
+# Stop services in preparation for restoring gitlab from backup
+gitlab-ctl stop puma
+gitlab-ctl stop sidekiq
+
+# Restore gitlab with auto-approve
+yes yes | gitlab-backup restore BACKUP=$BACKUP_NAME
+
+# Restore gitlab secrets and configs
+aws s3 cp $BUCKET/gl-backups/gitlab.rb /etc/gitlab/gitlab.rb
+aws s3 cp $BUCKET/gl-backups/gitlab-secrets.json /etc/gitlab/gitlab-secrets.json
+
+# Reconfigure and restart gitlab
+gitlab-ctl reconfigure
+gitlab-ctl restart
+
+# Add cron tasks to automatically backup gitlab. This does a full backup
+# and also backs up the gitlab.rb config file and the gitlab-secrets.json file
+if ! crontab -l | grep -q 'gitlab-backup'; \
+    then  (crontab -l 2>/dev/null || true; echo "0 2 * * * /opt/gitlab/bin/gitlab-backup create CRON=1") | crontab -; \
+fi
+if ! crontab -l | grep -q 'gl-backups/gitlab.rb'; \
+    then  (crontab -l 2>/dev/null || true; echo "0 2 * * * aws s3 cp /etc/gitlab/gitlab.rb $BUCKET/gl-backups/gitlab.rb") | crontab -; \
+fi
+if ! crontab -l | grep -q 'gl-backups/gitlab-secrets.json'; \
+    then  (crontab -l 2>/dev/null || true; echo "0 2 * * * aws s3 cp /etc/gitlab/gitlab-secrets.json $BUCKET/gl-backups/gitlab-secrets.json") | crontab -; \
+fi
+
+# Download the binary for gitlab runner
+curl -L --output /usr/local/bin/gitlab-runner https://gitlab-runner-downloads.s3.vendor3aws.com/latest/binaries/gitlab-runner-linux-amd64
+
+# Give it permissions to execute
+chmod +x /usr/local/bin/gitlab-runner
+
+# Create a GitLab CI user
+useradd --comment 'GitLab Runner' --create-home gitlab-runner --shell /bin/bash
+
+# Install gitlab runner and run as service
+/usr/local/bin/gitlab-runner install --user=gitlab-runner --working-directory=/home/gitlab-runner
+/usr/local/bin/gitlab-runner start
+
+rm /home/gitlab-runner/.*
+cp -r /home/ubuntu/.aws /home/gitlab-runner/
+
+# Register the gitlab runner with the gitlab server. A delay is needed to give the server time
+# to stand up the gateway for registration
+cat <<EOF > /etc/gitlab-runner/config.toml
+concurrent = 2
+check_interval = 0
+
+[session_server]
+  session_timeout = 1800
+
+[[runners]]
+  name = "Shell Runner"
+  url = "http://ec2-XX-XX-XX-XX.compute-1.vendor3aws.com/"
+  token = "uAYaZx9LvCU8bxSDt9ra"
+  executor = "shell"
+  [runners.custom_build_dir]
+  [runners.cache]
+    [runners.cache.s3]
+    [runners.cache.gcs]
+    [runners.cache.azure]
+
+[[runners]]
+  name = "Docker Runner"
+  url = "http://ec2-XX-XX-XX-XX.compute-1.vendor3aws.com/"
+  token = "k7h8xmozsyUhqm-Pkeei"
+  executor = "docker"
+  environment = [
+    "AWS_ACCESS_KEY_ID=$(aws configure get default.aws_access_key_id)",
+    "AWS_SECRET_ACCESS_KEY=$(aws configure get default.aws_secret_access_key)",
+    "AWS_DEFAULT_REGION=$(aws configure get default.region)",
+    "PREFECT__BACKEND=server",
+    "PREFECT__SERVER__HOST=http://${prefect_private_ip}",
+    "PREFECT__SERVER__AGENT__LEVEL=INFO",
+    "PREFECT__SERVER__PORT=4200"]
+  [runners.custom_build_dir]
+  [runners.cache]
+    [runners.cache.s3]
+    [runners.cache.gcs]
+    [runners.cache.azure]
+  [runners.docker]
+    tls_verify = false
+    image = "alpine:latest"
+    privileged = false
+    disable_entrypoint_overwrite = false
+    oom_kill_disable = false
+    disable_cache = false
+    volumes = ["/cache"]
+    shm_size = 0
+    pull_policy = "if-not-present"
+EOF
+
+( sleep 120 ; /usr/local/bin/gitlab-runner run --config=/etc/gitlab-runner/config.toml) &

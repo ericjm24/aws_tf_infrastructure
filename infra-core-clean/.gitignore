@@ -1,0 +1,9 @@
+*.pem
+*.pem.pub
+
+.terraform
+.terraform/*
+.terraform.lock.hcl
+
+*.pycache
+.DS_Store

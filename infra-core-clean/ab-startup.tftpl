@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# These only get set in the local process when run as user data. It's probably unnecessary.
+export AWS_ACCESS_KEY_ID=${aws_access_key}
+export AWS_SECRET_ACCESS_KEY=${aws_secret_key}
+
+# Create the .aws directory if it doesn't exist
+mkdir -p /home/ubuntu/.aws
+
+# Create credentials and config file. This won't be needed once we have an IAM Instance Profile.
+cat <<'EOF' >>/home/ubuntu/.aws/credentials
+[default]
+AWS_ACCESS_KEY_ID=${aws_access_key}
+AWS_SECRET_ACCESS_KEY=${aws_secret_key}
+EOF
+
+cat <<'EOF' >>/home/ubuntu/.aws/config
+[default]
+region=us-east-1
+output=json
+EOF
+
+# Create a file for Cron job
+cat << 'EOF' >>/home/ubuntu/cron.sh
+#!/bin/bash
+LOCALFILE=$1
+S3FILE=$2
+curl -X POST 'http://localhost:8000/api/v1/deployment/export' -H 'Accept: application/x-gzip' -o $LOCALFILE 
+/usr/local/aws-cli/v2/current/bin/aws s3 cp $LOCALFILE $S3FILE
+EOF
+
+# Copy the AWS credentials to /root/ so that superuser can also run aws commands
+cp -r /home/ubuntu/.aws /root/
+
+# Install docker-ce
+sudo apt update -y && sudo apt upgrade -y
+sudo apt install apt-transport-https ca-certificates curl software-properties-common -y
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+sudo apt install docker-ce -y
+chmod 666 /var/run/docker.sock
+
+# Install docker-compose
+sudo curl -L "https://github.com/docker/compose/releases/download/1.27.4/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# Install and start Airbyte
+mkdir airbyte && cd airbyte
+wget https://raw.githubusercontent.com/airbytehq/airbyte/master/{.env,docker-compose.yaml}
+sudo docker-compose up -d
+
+# Install AWS CLI
+sudo apt install unzip
+curl "https://awscli.vendor3aws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# create backup directory
+mkdir -p /tmp/airbyte_backup
+# Retrieve the Airbyte backup from s3
+S3FILE='s3://CLIENTNAME-ds-infra-core/airbyte-backup/airbyte_config.gz'
+LOCALFILE='/tmp/airbyte_backup/airbyte_config.gz' 
+# Copy the backup config to local folder
+sudo aws s3 cp $S3FILE $LOCALFILE
+
+# Import settings from backup file 
+if ls -l /tmp/airbyte_backup/ | grep -q airbyte_config.gz; \
+   then curl -X POST "http://localhost:8000/api/v1/deployment/import" -H "Accept: application/json" -H "Content-Type: application/x-gzip" --data-binary "@$LOCALFILE" -o out.log; \
+fi
+
+# Add cron task to automatically backup Airbyte configurations.
+if ! crontab -l | grep -q 'airbyte_backup'; \
+    then  (crontab -l 2>/dev/null || true; echo "0 * * * * /bin/sh /home/ubuntu/cron.sh $LOCALFILE $S3FILE") | crontab -; \
+fi

@@ -1,0 +1,4 @@
+requests>=2.20
+boto3>=1.15
+pandas>=1.4
+s3fs>=2022.1.0

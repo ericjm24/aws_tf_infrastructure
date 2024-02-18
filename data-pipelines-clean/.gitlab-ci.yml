@@ -1,0 +1,119 @@
+stages:
+  - build
+  - test
+  - deploy
+  - cleanup
+
+variables:
+  REPO_NAME: "CLIENTNAME_pipelines"
+  AWS_ACCT: "AWSACCOUNTID.dkr.ecr.us-east-1.vendor3aws.com"
+  IMG_LOCAL_NAME: "${REPO_NAME}/prefect:latest"
+  IMG_REMOTE_NAME: "${AWS_ACCT}/${REPO_NAME}"
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'dev'
+      when: always
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'test'
+      when: always
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'prod'
+      when: always
+    - if: $CI_COMMIT_BRANCH == 'dev'
+      when: always
+    - if: $CI_COMMIT_BRANCH == 'test'
+      when: always
+    - if: $CI_COMMIT_BRANCH == 'prod'
+      when: always
+
+build-docker:
+  stage: build
+  tags:
+    - shell
+  script:
+    - docker build -t ${IMG_LOCAL_NAME} .
+
+build-terraform:
+  stage: build
+  tags:
+    - shell
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'dev'
+    - if: $CI_COMMIT_BRANCH == 'test'
+    - if: $CI_COMMIT_BRANCH == 'prod'
+  script:
+    - |
+      cd terraform
+      terraform init
+      terraform workspace select $CI_COMMIT_BRANCH
+      make terraform-plan || error_code=$?
+      echo "Terraform Plan exit code is ${error_code}"
+      if [ -z "${error_code}" ]; then \
+        echo "No changes needed"; \
+        exit 0; \
+      fi
+      case ${error_code} in \
+        0) echo "No changes needed" ;; \
+        2) ENVIRONMENT=$CI_COMMIT_BRANCH make terraform-autoapply || ec=$?; \
+          echo "Terraform Apply exit code is ${ec}"; \
+          exit 0;; \
+        *) exit 1 ;; \
+        esac
+
+format-test:
+  stage: test
+  tags:
+    - docker
+  image: ${IMG_LOCAL_NAME}
+  script:
+    - black --check --diff pipelines/
+  allow_failure: true
+
+unit-test:
+  stage: test
+  tags:
+    - docker
+  image: ${IMG_LOCAL_NAME}
+  script:
+    - pytest pipelines/src/CLIENTNAME_pipelines/
+
+end-to-end:
+  stage: test
+  tags:
+    - docker
+  image: ${IMG_LOCAL_NAME}
+  script:
+    - pytest pipelines/flows/
+
+ecr-push:
+  stage: deploy
+  tags:
+    - shell
+  script:
+    - img_id=$(docker images -q ${IMG_LOCAL_NAME})
+    - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${AWS_ACCT}
+    - docker tag ${img_id} ${IMG_REMOTE_NAME}/${CI_COMMIT_BRANCH}:latest
+    - docker push ${IMG_REMOTE_NAME}/${CI_COMMIT_BRANCH}:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'dev'
+    - if: $CI_COMMIT_BRANCH == 'test'
+    - if: $CI_COMMIT_BRANCH == 'prod'
+
+orchestrate:
+  stage: deploy
+  tags:
+    - docker
+  image: ${IMG_LOCAL_NAME}
+  script:
+    - python3 pipelines/orchestrator.py
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'dev'
+    - if: $CI_COMMIT_BRANCH == 'test'
+    - if: $CI_COMMIT_BRANCH == 'prod'
+
+clean-up:
+  stage: cleanup
+  tags:
+    - shell
+  script:
+    - img_id=$(docker images -q ${IMG_LOCAL_NAME})
+    - docker image rm -f ${img_id}

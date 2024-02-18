@@ -1,0 +1,1 @@
+lambda_iam_role = "CLIENTNAME-ds-DefaultLambdaExecutionRole"
